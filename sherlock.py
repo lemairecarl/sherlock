@@ -23,17 +23,18 @@ from utils import MetricHistory, SimpleProfiler, plot_gate_histogram, plot_num_a
 from visdom_helper import VisdomHelper
 
 # TODO
-# data loader
-# model
-# criterion
+# Grid search
+# Dropout?
+# Sparsify
 
 parser = argparse.ArgumentParser()
 # Training setup and hyper params
 parser.add_argument('--load', '-l', type=str, default=None)
 parser.add_argument('--loadlast', type=str, default=None)
 parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
+parser.add_argument('--reg', default=1e-4, type=float, help='l2 regul')
 parser.add_argument('--n_epochs', '-e', default=200, type=int, help='max epochs')
-parser.add_argument('--batch_size', '-b', default=64, type=int)
+parser.add_argument('--batch_size', '-b', default=16, type=int)
 # Utilities
 parser.add_argument('--devices', '-d', type=str, default=None, help='device ids, e.g. 0,1,3')
 parser.add_argument('--workers', '-w', type=int, default=8, help='number of DataLoader workers')
@@ -97,16 +98,22 @@ class ClassificationTraining(object):
     def prepare_data(self):
         print('==> Preparing data...')
 
-        n_train, n_val = 4000, 1000
-        data_frame = pd.read_csv('hochelaga.csv', nrows=n_train + n_val)
+        #n_train, n_val = 4000, 1000
+        #data_frame = pd.read_csv('hochelaga.csv', nrows=n_train + n_val)
+        #data_frame = pd.read_csv('hochelaga.csv')
+        #print('Before drop dupl', len(data_frame))
+        #data_frame = data_frame.drop_duplicates('section_id')
+        #print(' After drop dupl', len(data_frame))
         #print('Targets', data_frame.iloc[0, 3:9])
         #print('Predictors', data_frame.iloc[0, 18:])
-        predictors = data_frame.iloc[:, 22:].values
-        targets = data_frame.iloc[:, 3:9].values
-        predictors, targets = torch.Tensor(predictors), torch.Tensor(targets)
+        #predictors = data_frame.iloc[:, 22:].values
+        #targets = data_frame.iloc[:, 3:9].values
+        #predictors, targets = torch.Tensor(predictors), torch.Tensor(targets)
+        #targets.div_(100.0)  # Convert percent to ratio
+        predictors, targets = torch.load('hochelaga_sections.pt')
         self.dataset = data.TensorDataset(predictors, targets)
 
-        train_idx, val_idx = self.get_validation_set(self.dataset, validation_ratio=0.2)
+        train_idx, val_idx = self.get_validation_set(self.dataset, validation_ratio=0.1)
         train_sampler = SubsetRandomSampler(train_idx)
         val_sampler = SubsetRandomSampler(val_idx)
         self.train_loader = data.DataLoader(self.dataset, args.batch_size, num_workers=args.workers,
@@ -117,7 +124,7 @@ class ClassificationTraining(object):
         self.num_features = predictors.size(1)
         self.num_classes = targets.size(1)
 
-    def make_optimizer(self, l2_reg=1e-3):
+    def make_optimizer(self, l2_reg=args.reg):
         self.optimizer = optim.Adam(self.parallel_net.parameters(), weight_decay=l2_reg)
 
     def set_l2_reg(self, amount):
@@ -126,29 +133,33 @@ class ClassificationTraining(object):
     def prepare_model(self):
         print('==> Preparing model...')
 
+        dropout_p = 0.2
+
         # Build network
         self.net = torch.nn.Sequential(
             torch.nn.Linear(self.num_features, 512),
             torch.nn.BatchNorm1d(512),
             torch.nn.ReLU(),
-            torch.nn.Dropout(),
+            torch.nn.Dropout(dropout_p),
             torch.nn.Linear(512, 256),
             torch.nn.BatchNorm1d(256),
             torch.nn.ReLU(),
-            torch.nn.Dropout(),
+            torch.nn.Dropout(dropout_p),
             torch.nn.Linear(256, 128),
             torch.nn.BatchNorm1d(128),
             torch.nn.ReLU(),
-            torch.nn.Dropout(),
-            torch.nn.Linear(128, self.num_classes)
+            torch.nn.Dropout(dropout_p),
+            torch.nn.Linear(128, self.num_classes),
+            torch.nn.LogSoftmax()
         )
 
-        self.net.cuda()
-        if args.devices is None:
-            self.parallel_net = DataParallel(self.net)
-        else:
-            devices = [int(i) for i in args.devices.split(',')]
-            self.parallel_net = DataParallel(self.net, devices)
+        #self.net.cuda()
+        #if args.devices is None:
+        #    self.parallel_net = DataParallel(self.net)
+        #else:
+        #    devices = [int(i) for i in args.devices.split(',')]
+        #    self.parallel_net = DataParallel(self.net, devices)
+        self.parallel_net = self.net
 
         self.make_optimizer()
         self.make_monitors()
@@ -165,7 +176,7 @@ class ClassificationTraining(object):
         elif args.load is not None:
             self.load(args.load)
 
-        self.criterion = torch.nn.MultiLabelSoftMarginLoss().cuda()
+        self.criterion = torch.nn.KLDivLoss()  #.cuda()
 
     def prepare_visdom(self):
         env_name = 'sherlock'
@@ -232,19 +243,22 @@ class ClassificationTraining(object):
             os.remove(self.last_checkpoint)
         self.last_checkpoint = full_filename
 
+    def error_fn(self, output, target):
+        return torch.mean(torch.abs(torch.exp(output[:, 0]) - target[:, 0]) / target[:, 0])
+
     def train_epoch(self, epoch):
-        print('\nEpoch: %d' % epoch)
+        #print('\nEpoch: %d' % epoch)
         self.parallel_net.train()
 
         profiler = SimpleProfiler(['loader', 'variables', 'forward', 'backward', 'sync', 'monitor'])
 
-        for batch_idx, (images, targets) in tqdm(enumerate(self.train_loader), total=len(self.train_loader)):
+        for batch_idx, (images, targets) in enumerate(self.train_loader):
             if args.cut and batch_idx == 20:
                 break
 
             profiler.step()  # loader
 
-            targets = targets.cuda(async=True)
+            #targets = targets.cuda(async=True)
             input_var = torch.autograd.Variable(images)
             target_var = torch.autograd.Variable(targets)
             profiler.step()  # variables
@@ -261,8 +275,10 @@ class ClassificationTraining(object):
             loss_value = float(loss)
             profiler.step()  # sync (fetching the value of the loss causes a sync between CPU and GPU)
 
-            prec1 = accuracy(output.data, targets, topk=(1,))
-            self.monitors['accu_train'].update(float(prec1[0]))
+            #_, single_target = torch.max(targets, dim=1)
+            #prec1 = accuracy(output.data, single_target.long(), topk=(1,))
+            err = self.error_fn(output.data, targets)
+            self.monitors['accu_train'].update(float(err))
             self.monitors['loss_train'].update(loss_value)
 
             if args.print_freq != -1 and batch_idx % args.print_freq == 0:
@@ -283,14 +299,14 @@ class ClassificationTraining(object):
         self.monitors['accu_train'].end_epoch()
 
     def val_epoch(self, epoch):
-        print('\nTest: %d' % epoch)
+        #print('\nTest: %d' % epoch)
         self.parallel_net.eval()
 
-        for batch_idx, (images, targets) in tqdm(enumerate(self.val_loader), total=len(self.val_loader)):
+        for batch_idx, (images, targets) in enumerate(self.val_loader):
             if args.cut and batch_idx == 20:
                 break
 
-            targets = targets.cuda(async=True)
+            #targets = targets.cuda(async=True)
             input_var = torch.autograd.Variable(images, volatile=True)
             target_var = torch.autograd.Variable(targets, volatile=True)
 
@@ -299,8 +315,8 @@ class ClassificationTraining(object):
             loss = self.criterion(output, target_var)
             loss_value = float(loss)
 
-            prec1 = accuracy(output.data, targets, topk=(1,))
-            self.monitors['accu_val'].update(float(prec1[0]))
+            err = self.error_fn(output.data, targets)
+            self.monitors['accu_val'].update(float(err))
             self.monitors['loss_val'].update(loss_value)
 
             if args.print_freq != -1 and batch_idx % args.print_freq == 0:

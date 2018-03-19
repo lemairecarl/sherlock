@@ -1,4 +1,7 @@
 .idea/
+checkpoint/
 
+*.pt
+*.npy
 *.csv
 *.tar.gz
