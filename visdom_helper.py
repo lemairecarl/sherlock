@@ -58,11 +58,13 @@ class VisdomHelper(object):
         _vis.line(Y, X, env=self.env, win='loss',
                   opts=dict(title='Loss', xlabel='Epoch', ylabel='Loss', legend=['Train', 'Test']))
 
-    def accu_train_val(self):
-        if self.monitors['accu_val'].num_epochs == 0:
+    def accu_train_val(self, skip=2):
+        if self.monitors['accu_val'].num_epochs <= skip:
             return
-        Y = np.stack([self.monitors['accu_train'].epochs, self.monitors['accu_val'].epochs], axis=1)
-        X = np.arange(self.monitors['accu_val'].num_epochs)
+        accu_train = self.monitors['accu_train'].epochs[skip:]
+        accu_val = self.monitors['accu_val'].epochs[skip:]
+        Y = np.stack([accu_train, accu_val], axis=1)
+        X = np.arange(len(accu_train)) + skip
         _vis.line(Y, X, env=self.env, win='accu',
                   opts=dict(title='Accuracy', xlabel='Epoch', ylabel='Accuracy', legend=['Train', 'Test']))
 
@@ -78,6 +80,17 @@ class VisdomHelper(object):
         self.loss_train_val()
         self.accu_train_val()
         self.plot_compression()
+
+    def plot_monitors(self, monitors, title, ylabel, legend, skip=2):
+        if monitors[0].num_epochs <= skip:
+            return
+        curves = [m.epochs[skip:] for m in monitors]
+        if len(curves[0]) == 0:
+            return
+        Y = np.stack(curves, axis=1)
+        X = np.arange(len(curves[0])) + skip
+        _vis.line(Y, X, env=self.env, win=title,
+                  opts=dict(title=title, xlabel='Epoch', ylabel=ylabel, legend=legend))
 
     def image(self, img, win):
         _vis.image(img, env=self.env, win=win)

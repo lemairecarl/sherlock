@@ -1,48 +1,54 @@
 import argparse
 import glob
 import os
-import sys
 import time
-import itertools
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.backends.cudnn
 import torch.optim as optim
-import torch.nn.functional as F
 import torch.utils.data as data
-from torch.nn.parallel import DataParallel
 from torch.utils.data.sampler import SubsetRandomSampler
-from torchvision import transforms, datasets
-from tqdm import tqdm
 
-from utils import MetricHistory, SimpleProfiler, plot_gate_histogram, plot_num_alive
+from utils import MetricHistory, SimpleProfiler
 from visdom_helper import VisdomHelper
+from preprocess import target_col_names
+
 
 # TODO
-# Select fields, convert to ratios
-# Preprocess - center, whiten, etc
+# Test set (check val/test set bias)
 # Grid search
 # Dropout?
+# depth/width
+# ablation de: lat/long
 # Sparsify
+
+def str2bool(x):
+    if x == 1 or x == 'Y':
+        return True
+    elif x == 0 or x == 'F':
+        return False
+    else:
+        raise TypeError('Could not cast to bool.')
 
 parser = argparse.ArgumentParser()
 # Training setup and hyper params
 parser.add_argument('--load', '-l', type=str, default=None)
 parser.add_argument('--loadlast', type=str, default=None)
-parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
-parser.add_argument('--reg', default=1e-4, type=float, help='l2 regul')
-parser.add_argument('--n_epochs', '-e', default=200, type=int, help='max epochs')
+parser.add_argument('--lr', default=0.2, type=float, help='learning rate')
+parser.add_argument('--steps', default='100,200', type=str, help='epoch ids of lr step, e.g. 30,60,100')
+parser.add_argument('--reg', default=5e-4, type=float, help='l2 regul')
+parser.add_argument('--n_epochs', '-e', default=300, type=int, help='max epochs')
 parser.add_argument('--batch_size', '-b', default=32, type=int)
 # Utilities
 parser.add_argument('--tuning', action='store_true')
 parser.add_argument('--devices', '-d', type=str, default=None, help='device ids, e.g. 0,1,3')
 parser.add_argument('--workers', '-w', type=int, default=8, help='number of DataLoader workers')
 parser.add_argument('--cut', action='store_true', help='cut epoch short')
-parser.add_argument('--delete', action='store_true', help='delete parent checkpoint')
+parser.add_argument('--delete', type=str2bool, default=True, help='delete parent checkpoint')
 parser.add_argument('--novis', action='store_true', help='turn off visdom')
 parser.add_argument('--print_freq', default=-1, type=int)
+parser.add_argument('--cuda', action='store_true')
 args = parser.parse_args()
 
 
@@ -54,9 +60,14 @@ class ClassificationTraining(object):
 
     def __init__(self):
         self.monitors = None
+        self.err_monitors = None
+        self.rerr_monitors = None
+        self.class_names = target_col_names[:4]
         self.parent = ''
         self.start_epoch = 0
         self.checkpoint_filename_pattern = None
+        self.lr_steps = [] if args.steps is None else [int(x) for x in args.steps.split(',')]
+        self.scheduler = None
 
         self.dataset = None
         self.train_transform = None
@@ -66,7 +77,6 @@ class ClassificationTraining(object):
         self.num_classes = None
 
         self.net = None
-        self.parallel_net = None
         self.sparse_conv, self.sparse_linear = [], []
         self.total_sparse_conv, self.total_sparse_linear = 0, 0
         self.box_encoder = None
@@ -80,6 +90,8 @@ class ClassificationTraining(object):
     def make_monitors(self):
         self.monitors = {name: MetricHistory() for name in ('loss_train', 'loss_val', 'accu_train', 'accu_val',
                                                             'alive_conv', 'alive_lin')}
+        self.err_monitors = [MetricHistory() for _ in self.class_names]
+        self.rerr_monitors = [MetricHistory() for _ in self.class_names]
 
     @staticmethod
     def get_validation_set(dataset, validation_ratio=0.1):
@@ -114,7 +126,8 @@ class ClassificationTraining(object):
         self.num_classes = targets.size(1)
 
     def make_optimizer(self, l2_reg=args.reg):
-        self.optimizer = optim.Adam(self.parallel_net.parameters(), weight_decay=l2_reg)
+        self.optimizer = optim.Adam(self.net.parameters(), weight_decay=l2_reg)
+        self.scheduler = optim.lr_scheduler.MultiStepLR(self.optimizer, self.lr_steps, gamma=0.1)
 
     def set_l2_reg(self, amount):
         self.make_optimizer(l2_reg=amount)
@@ -126,29 +139,24 @@ class ClassificationTraining(object):
 
         # Build network
         self.net = torch.nn.Sequential(
-            torch.nn.Linear(self.num_features, 512),
-            torch.nn.BatchNorm1d(512),
+            torch.nn.Linear(self.num_features, 64),
+            torch.nn.BatchNorm1d(64),
             torch.nn.ReLU(),
-            torch.nn.Dropout(dropout_p),
-            torch.nn.Linear(512, 256),
+            #torch.nn.Dropout(dropout_p),
+            torch.nn.Linear(64, 256),
             torch.nn.BatchNorm1d(256),
             torch.nn.ReLU(),
-            torch.nn.Dropout(dropout_p),
-            torch.nn.Linear(256, 128),
-            torch.nn.BatchNorm1d(128),
+            #torch.nn.Dropout(dropout_p),
+            torch.nn.Linear(256, 1024),
+            torch.nn.BatchNorm1d(1024),
             torch.nn.ReLU(),
-            torch.nn.Dropout(dropout_p),
-            torch.nn.Linear(128, self.num_classes),
+            #torch.nn.Dropout(dropout_p),
+            torch.nn.Linear(1024, self.num_classes),
             torch.nn.LogSoftmax(dim=1)
         )
 
-        #self.net.cuda()
-        #if args.devices is None:
-        #    self.parallel_net = DataParallel(self.net)
-        #else:
-        #    devices = [int(i) for i in args.devices.split(',')]
-        #    self.parallel_net = DataParallel(self.net, devices)
-        self.parallel_net = self.net
+        if args.cuda:
+            self.net.cuda()
 
         self.make_optimizer()
         self.make_monitors()
@@ -165,7 +173,9 @@ class ClassificationTraining(object):
         elif args.load is not None:
             self.load(args.load)
 
-        self.criterion = torch.nn.KLDivLoss()  #.cuda()
+        self.criterion = torch.nn.KLDivLoss()
+        if args.cuda:
+            self.criterion.cuda()
 
     def prepare_visdom(self):
         env_name = 'sherlock'
@@ -233,29 +243,46 @@ class ClassificationTraining(object):
         self.last_checkpoint = full_filename
         return filename
 
-    def error_fn(self, output, target):
-        #e = torch.abs(torch.exp(output[:, 0]) - target[:, 0]) / target[:, 0]  # rel
-        e = torch.abs(torch.exp(output[:, 0]) - target[:, 0])  # abs
-        return torch.mean(e)
+    def error_fn(self, output, target, relative=False):
+        total_pct = target.sum(dim=1, keepdim=True)
+        if relative:
+            e = torch.abs(torch.exp(output) * total_pct - target) / target
+        else:
+            e = torch.abs(torch.exp(output) * total_pct - target)
+        return torch.mean(e, dim=0)
+
+    def update_err_monitors(self, err, rerr):
+        for mon, cerr in zip(self.err_monitors, err):
+            mon.update(float(cerr))
+        for mon, cerr in zip(self.rerr_monitors, rerr):
+            mon.update(float(cerr))
+
+    def epoch_end_err_monitors(self):
+        for mon in self.err_monitors + self.rerr_monitors:
+            mon.end_epoch()
 
     def train_epoch(self, epoch):
         #print('\nEpoch: %d' % epoch)
-        self.parallel_net.train()
+        self.net.train()
 
         profiler = SimpleProfiler(['loader', 'variables', 'forward', 'backward', 'sync', 'monitor'])
 
-        for batch_idx, (images, targets) in enumerate(self.train_loader):
+        for batch_idx, (input_data, targets) in enumerate(self.train_loader):
             if args.cut and batch_idx == 20:
                 break
 
             profiler.step()  # loader
 
-            #targets = targets.cuda(async=True)
-            input_var = torch.autograd.Variable(images)
-            target_var = torch.autograd.Variable(targets)
+            if args.cuda:
+                input_data = input_data.cuda(async=True)
+                targets = targets.cuda(async=True)
+
+            input_var = torch.autograd.Variable(input_data)
+            targets_norm = targets / targets.sum(dim=1, keepdim=True)  # sum to 1
+            target_var = torch.autograd.Variable(targets_norm)
             profiler.step()  # variables
 
-            output = self.parallel_net(input_var)
+            output = self.net(input_var)
             loss = self.criterion(output, target_var)
             profiler.step()   # forward
 
@@ -267,10 +294,8 @@ class ClassificationTraining(object):
             loss_value = float(loss)
             profiler.step()  # sync (fetching the value of the loss causes a sync between CPU and GPU)
 
-            #_, single_target = torch.max(targets, dim=1)
-            #prec1 = accuracy(output.data, single_target.long(), topk=(1,))
             err = self.error_fn(output.data, targets)
-            self.monitors['accu_train'].update(float(err))
+            self.monitors['accu_train'].update(float(err[0]))  # qs
             self.monitors['loss_train'].update(loss_value)
 
             if args.print_freq != -1 and batch_idx % args.print_freq == 0:
@@ -292,24 +317,30 @@ class ClassificationTraining(object):
 
     def val_epoch(self, epoch):
         #print('\nTest: %d' % epoch)
-        self.parallel_net.eval()
+        self.net.eval()
 
-        for batch_idx, (images, targets) in enumerate(self.val_loader):
+        for batch_idx, (input_data, targets) in enumerate(self.val_loader):
             if args.cut and batch_idx == 20:
                 break
 
-            #targets = targets.cuda(async=True)
-            input_var = torch.autograd.Variable(images, volatile=True)
-            target_var = torch.autograd.Variable(targets, volatile=True)
+            if args.cuda:
+                input_data = input_data.cuda(async=True)
+                targets = targets.cuda(async=True)
+
+            input_var = torch.autograd.Variable(input_data, volatile=True)
+            targets_norm = targets / targets.sum(dim=1, keepdim=True)  # sum to 1
+            target_var = torch.autograd.Variable(targets_norm, volatile=True)
 
             # compute output
-            output = self.parallel_net(input_var)
+            output = self.net(input_var)
             loss = self.criterion(output, target_var)
             loss_value = float(loss)
 
             err = self.error_fn(output.data, targets)
-            self.monitors['accu_val'].update(float(err))
+            self.monitors['accu_val'].update(float(err[0]))  # qs
             self.monitors['loss_val'].update(loss_value)
+            rerr = self.error_fn(output.data, targets, relative=True)
+            self.update_err_monitors(err, rerr)
 
             if args.print_freq != -1 and batch_idx % args.print_freq == 0:
                 print('{}     {}/{}    Last loss: {:.6f}    Avg loss: {:.6f}'.format(time.strftime("%Y-%m-%d %H-%M-%S"),
@@ -322,10 +353,15 @@ class ClassificationTraining(object):
 
         self.monitors['loss_val'].end_epoch()
         self.monitors['accu_val'].end_epoch()
+        self.epoch_end_err_monitors()
 
     def train(self, num_epochs=200, do_save=True):
+        print('==> Training...')
         for epoch in range(self.start_epoch, self.start_epoch + num_epochs):
             self.vis.plot_metrics()
+            self.vis.plot_monitors(self.err_monitors, 'Erreur absolue', 'Erreur absolue', self.class_names)
+            self.vis.plot_monitors(self.rerr_monitors, 'Erreur relative', 'Erreur relative', self.class_names)
+            self.scheduler.step(epoch)
             self.train_epoch(epoch)
             self.val_epoch(epoch)
             if do_save:
@@ -360,8 +396,9 @@ def print_args(args_dict):
 def hyperparam_tuning():
     import itertools
 
-    lr_choices = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
-    reg_choices = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+    # 0.2, 5e-4
+    lr_choices = [5e-2, 1e-1, 2e-1, 5e-1]
+    reg_choices = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
 
     results = {}
 
@@ -374,12 +411,12 @@ def hyperparam_tuning():
             training = ClassificationTraining()
             training.train(args.n_epochs, do_save=False)
 
-            minerr = min(training.monitors['accu_val'].epochs)
-            print('Min rel err: {}'.format(minerr))
-            results[lr, reg] = minerr
+            lasterr = np.mean(training.monitors['accu_val'].epochs[:-10])
+            print('Last err: {}'.format(lasterr))
 
             fn = training.save()
             print('Saved: ' + fn)
+            results[lr, reg] = lasterr, fn
     except KeyboardInterrupt:
         pass
 

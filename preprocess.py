@@ -1,14 +1,15 @@
 import numpy as np
 import pandas as pd
 import torch
+from scipy.cluster.vq import whiten
 
 print('Loading data...')
 dataf = pd.read_csv('hochelaga.csv')
 
-#print('Removing duplicates...')
-#print('Before drop dupl', len(data_frame))
-#data_frame = data_frame.drop_duplicates('code_postal')
-#print(' After drop dupl', len(data_frame))
+print('Removing duplicates...')
+print('Before drop dupl', len(dataf))
+dataf = dataf.drop_duplicates('code_postal')
+print(' After drop dupl', len(dataf))
 
 target_col_names = ['pct_qs',
                     'pct_pq',
@@ -16,10 +17,17 @@ target_col_names = ['pct_qs',
                     'pct_caq',
                     'pct_on',
                     'pct_pv']
+target_vars = [dataf[k] for k in target_col_names]
+
+print('Selecting and transforming variables...')
 sel_vars = [
+    dataf['lat'],
+    dataf['lon'],
+    #dataf['zone_urbaine'],
+    dataf['appartement?'],
     # POPULATION
     dataf['PP_FEMALE'] / dataf['PP_TOT'],
-    dataf['PP_AGE_MED'],
+    dataf['PP_PP_MED'],
     dataf['PP_LMR'] / dataf['PP_POP15_'],  # PP_LMR/PP_POP15_
     ##FAMILY
     dataf['FM_2P'] / dataf['FM_TOT'],  #"m_FM_2_FAM_PROP" = FM_2P/FM_TOT,
@@ -70,11 +78,22 @@ sel_vars = [
     dataf['RL_MUSL'] / dataf['RL_TOT'],  #"m_RL_MUSL_PROP" = RL_MUSL / RL_TOT)
     ]
 
-exit(0)
-predictors = dataf.iloc[:, 22:].values
-targets = dataf.iloc[:, 3:9].values
+print('Converting to tensors...')
+predictors = np.array([col.values for col in sel_vars]).T
+predictors = np.nan_to_num(predictors)
+#print(np.std(predictors, axis=0))
+predictors -= np.mean(predictors, axis=0)
+predictors = whiten(predictors)
+targets = np.array([col.values for col in target_vars]).T
+targets = targets / 100.0
 predictors, targets = torch.Tensor(predictors), torch.Tensor(targets)
-targets = targets / targets.sum(dim=1)[:, None]
+
+print('Predictiors:', predictors.shape)
+print('Targets:    ', targets.shape)
+
+#print('Normalizing input variables...')
+#predictors -= torch.mean(predictors, dim=0)
+#predictors /= torch.std(predictors, dim=0)
 
 print('Saving...')
 torch.save((predictors, targets), 'hochelaga_postal.pt')
