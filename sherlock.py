@@ -1,5 +1,3 @@
-from __future__ import print_function
-
 import argparse
 import glob
 import os
@@ -23,6 +21,8 @@ from utils import MetricHistory, SimpleProfiler, plot_gate_histogram, plot_num_a
 from visdom_helper import VisdomHelper
 
 # TODO
+# Select fields, convert to ratios
+# Preprocess - center, whiten, etc
 # Grid search
 # Dropout?
 # Sparsify
@@ -34,8 +34,9 @@ parser.add_argument('--loadlast', type=str, default=None)
 parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
 parser.add_argument('--reg', default=1e-4, type=float, help='l2 regul')
 parser.add_argument('--n_epochs', '-e', default=200, type=int, help='max epochs')
-parser.add_argument('--batch_size', '-b', default=16, type=int)
+parser.add_argument('--batch_size', '-b', default=32, type=int)
 # Utilities
+parser.add_argument('--tuning', action='store_true')
 parser.add_argument('--devices', '-d', type=str, default=None, help='device ids, e.g. 0,1,3')
 parser.add_argument('--workers', '-w', type=int, default=8, help='number of DataLoader workers')
 parser.add_argument('--cut', action='store_true', help='cut epoch short')
@@ -98,19 +99,7 @@ class ClassificationTraining(object):
     def prepare_data(self):
         print('==> Preparing data...')
 
-        #n_train, n_val = 4000, 1000
-        #data_frame = pd.read_csv('hochelaga.csv', nrows=n_train + n_val)
-        #data_frame = pd.read_csv('hochelaga.csv')
-        #print('Before drop dupl', len(data_frame))
-        #data_frame = data_frame.drop_duplicates('section_id')
-        #print(' After drop dupl', len(data_frame))
-        #print('Targets', data_frame.iloc[0, 3:9])
-        #print('Predictors', data_frame.iloc[0, 18:])
-        #predictors = data_frame.iloc[:, 22:].values
-        #targets = data_frame.iloc[:, 3:9].values
-        #predictors, targets = torch.Tensor(predictors), torch.Tensor(targets)
-        #targets.div_(100.0)  # Convert percent to ratio
-        predictors, targets = torch.load('hochelaga_sections.pt')
+        predictors, targets = torch.load('hochelaga_postal.pt')
         self.dataset = data.TensorDataset(predictors, targets)
 
         train_idx, val_idx = self.get_validation_set(self.dataset, validation_ratio=0.1)
@@ -150,7 +139,7 @@ class ClassificationTraining(object):
             torch.nn.ReLU(),
             torch.nn.Dropout(dropout_p),
             torch.nn.Linear(128, self.num_classes),
-            torch.nn.LogSoftmax()
+            torch.nn.LogSoftmax(dim=1)
         )
 
         #self.net.cuda()
@@ -242,9 +231,12 @@ class ClassificationTraining(object):
         if args.delete and self.last_checkpoint is not None:
             os.remove(self.last_checkpoint)
         self.last_checkpoint = full_filename
+        return filename
 
     def error_fn(self, output, target):
-        return torch.mean(torch.abs(torch.exp(output[:, 0]) - target[:, 0]) / target[:, 0])
+        #e = torch.abs(torch.exp(output[:, 0]) - target[:, 0]) / target[:, 0]  # rel
+        e = torch.abs(torch.exp(output[:, 0]) - target[:, 0])  # abs
+        return torch.mean(e)
 
     def train_epoch(self, epoch):
         #print('\nEpoch: %d' % epoch)
@@ -331,12 +323,13 @@ class ClassificationTraining(object):
         self.monitors['loss_val'].end_epoch()
         self.monitors['accu_val'].end_epoch()
 
-    def train(self, num_epochs=200):
+    def train(self, num_epochs=200, do_save=True):
         for epoch in range(self.start_epoch, self.start_epoch + num_epochs):
             self.vis.plot_metrics()
             self.train_epoch(epoch)
             self.val_epoch(epoch)
-            self.save()
+            if do_save:
+                self.save()
 
 
 def accuracy(output, target, topk=(1,)):
@@ -364,8 +357,41 @@ def print_args(args_dict):
     print('============================================')
 
 
+def hyperparam_tuning():
+    import itertools
+
+    lr_choices = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+    reg_choices = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+
+    results = {}
+
+    try:
+        for lr, reg in itertools.product(lr_choices, reg_choices):
+            print('Trying: {:.2e}  {:.2e}'.format(lr, reg))
+            args.lr = lr
+            args.reg = reg
+
+            training = ClassificationTraining()
+            training.train(args.n_epochs, do_save=False)
+
+            minerr = min(training.monitors['accu_val'].epochs)
+            print('Min rel err: {}'.format(minerr))
+            results[lr, reg] = minerr
+
+            fn = training.save()
+            print('Saved: ' + fn)
+    except KeyboardInterrupt:
+        pass
+
+    torch.save(results, 'tuning.pt')
+
+
 if __name__ == '__main__':
 
     print_args(vars(args))
-    training = ClassificationTraining()
-    training.train(args.n_epochs)
+
+    if args.tuning:
+        hyperparam_tuning()
+    else:
+        training = ClassificationTraining()
+        training.train(args.n_epochs)
