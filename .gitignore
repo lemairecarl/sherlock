@@ -5,3 +5,4 @@ checkpoint/
 *.npy
 *.csv
 *.tar.gz
+*.tar

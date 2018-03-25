@@ -58,7 +58,7 @@ class VisdomHelper(object):
         _vis.line(Y, X, env=self.env, win='loss',
                   opts=dict(title='Loss', xlabel='Epoch', ylabel='Loss', legend=['Train', 'Test']))
 
-    def accu_train_val(self, skip=2):
+    def accu_train_val(self, metric_name='Accuracy', skip=2):
         if self.monitors['accu_val'].num_epochs <= skip:
             return
         accu_train = self.monitors['accu_train'].epochs[skip:]
@@ -66,20 +66,11 @@ class VisdomHelper(object):
         Y = np.stack([accu_train, accu_val], axis=1)
         X = np.arange(len(accu_train)) + skip
         _vis.line(Y, X, env=self.env, win='accu',
-                  opts=dict(title='Accuracy', xlabel='Epoch', ylabel='Accuracy', legend=['Train', 'Test']))
+                  opts=dict(title=metric_name, xlabel='Epoch', ylabel=metric_name, legend=['Train', 'Test']))
 
-    def plot_compression(self):
-        if self.monitors['alive_conv'].num_epochs == 0:
-            return
-        Y = np.stack([self.monitors['alive_conv'].epochs, self.monitors['alive_lin'].epochs], axis=1)
-        X = np.arange(self.monitors['alive_conv'].num_epochs)
-        _vis.line(Y, X, env=self.env, win='alive',
-                  opts=dict(title='Alive neurons', xlabel='Epoch', ylabel='Alive ratio', legend=['Conv', 'FC']))
-
-    def plot_metrics(self):
+    def plot_metrics(self, accu_name='Err abs QS'):
         self.loss_train_val()
-        self.accu_train_val()
-        self.plot_compression()
+        self.accu_train_val(metric_name=accu_name)
 
     def plot_monitors(self, monitors, title, ylabel, legend, skip=2):
         if monitors[0].num_epochs <= skip:

@@ -12,38 +12,38 @@ from torch.utils.data.sampler import SubsetRandomSampler
 
 from utils import MetricHistory, SimpleProfiler
 from visdom_helper import VisdomHelper
-from preprocess import target_col_names
 
 
 # TODO
-# Test set (check val/test set bias)
-# Grid search
+# par electeur
+    # par electeur: test set bias
+    # grid search
 # Dropout?
 # depth/width
-# ablation de: lat/long
 # Sparsify
 
 def str2bool(x):
-    if x == 1 or x == 'Y':
+    if x == 1 or x == 'Y' or x == 'T':
         return True
-    elif x == 0 or x == 'F':
+    elif x == 0 or x == 'N' or x == 'F':
         return False
     else:
         raise TypeError('Could not cast to bool.')
 
 parser = argparse.ArgumentParser()
 # Training setup and hyper params
+parser.add_argument('granularite', choices=['el', 'post'])
 parser.add_argument('--load', '-l', type=str, default=None)
-parser.add_argument('--loadlast', type=str, default=None)
+parser.add_argument('--path', type=str, default=None)
 parser.add_argument('--lr', default=0.2, type=float, help='learning rate')
-parser.add_argument('--steps', default='100,200', type=str, help='epoch ids of lr step, e.g. 30,60,100')
-parser.add_argument('--reg', default=5e-4, type=float, help='l2 regul')
+parser.add_argument('--steps', default='20,100', type=str, help='epoch ids of lr step, e.g. 30,60,100')
+parser.add_argument('--reg', default=1e-3, type=float, help='l2 regul')
 parser.add_argument('--n_epochs', '-e', default=300, type=int, help='max epochs')
 parser.add_argument('--batch_size', '-b', default=32, type=int)
 # Utilities
 parser.add_argument('--tuning', action='store_true')
 parser.add_argument('--devices', '-d', type=str, default=None, help='device ids, e.g. 0,1,3')
-parser.add_argument('--workers', '-w', type=int, default=8, help='number of DataLoader workers')
+parser.add_argument('--workers', '-w', type=int, default=1, help='number of DataLoader workers')
 parser.add_argument('--cut', action='store_true', help='cut epoch short')
 parser.add_argument('--delete', type=str2bool, default=True, help='delete parent checkpoint')
 parser.add_argument('--novis', action='store_true', help='turn off visdom')
@@ -52,7 +52,7 @@ parser.add_argument('--cuda', action='store_true')
 args = parser.parse_args()
 
 
-torch.backends.cudnn.benchmark = True  # Improves speed
+#torch.backends.cudnn.benchmark = True  # Improves speed
 
 
 class ClassificationTraining(object):
@@ -62,7 +62,7 @@ class ClassificationTraining(object):
         self.monitors = None
         self.err_monitors = None
         self.rerr_monitors = None
-        self.class_names = target_col_names[:4]
+        self.class_names = ['qs', 'pq', 'plq', 'caq']  # , 'on', 'pv']
         self.parent = ''
         self.start_epoch = 0
         self.checkpoint_filename_pattern = None
@@ -111,7 +111,8 @@ class ClassificationTraining(object):
     def prepare_data(self):
         print('==> Preparing data...')
 
-        predictors, targets = torch.load('hochelaga_postal.pt')
+        data_file = 'hochelaga_{}.pt'.format({'el': 'electeur', 'post': 'postal'}[args.granularite])
+        predictors, targets = torch.load(data_file)
         self.dataset = data.TensorDataset(predictors, targets)
 
         train_idx, val_idx = self.get_validation_set(self.dataset, validation_ratio=0.1)
@@ -162,11 +163,11 @@ class ClassificationTraining(object):
         self.make_monitors()
 
         # Load model state, optimizer state and monitors
-        if args.loadlast is not None:
-            list_of_files = glob.glob(os.path.join(args.loadlast, '*.pt'))
+        if not args.tuning and args.path is not None:
+            list_of_files = glob.glob(os.path.join(args.path, '*.pt'))
             if len(list_of_files) > 0:
                 last_file = max(list_of_files, key=os.path.getctime)
-                last_file = os.path.join(args.loadlast, os.path.basename(last_file))  # glob *sometimes* return abs path
+                last_file = os.path.join(args.path, os.path.basename(last_file))  # glob *sometimes* return abs path
                 self.load(last_file)
             else:
                 print('WARNING: Checkpoint dir is empty. Training from scratch.')
@@ -187,8 +188,8 @@ class ClassificationTraining(object):
 
     @staticmethod
     def full_path(filename):
-        if args.loadlast is not None:
-            path = args.loadlast
+        if args.path is not None:
+            path = args.path
         else:
             path = os.environ.get('SHERLOCK_CKPT', 'checkpoint')
         if not os.path.isdir(path):
@@ -238,7 +239,7 @@ class ClassificationTraining(object):
             'args': vars(args)  # convert args to dict
         }
         torch.save(c, full_filename)
-        if args.delete and self.last_checkpoint is not None:
+        if not args.tuning and args.delete and self.last_checkpoint is not None:
             os.remove(self.last_checkpoint)
         self.last_checkpoint = full_filename
         return filename
@@ -308,7 +309,7 @@ class ClassificationTraining(object):
                                    self.monitors['loss_train'].avg, self.monitors['accu_train'].avg)
             if batch_idx > 0:
                 self.vis.show_dict(profiler.to_dict(), win='time')
-                if batch_idx % 200 == 0:
+                if batch_idx < 2000 and batch_idx % 200 == 0:
                     self.vis.loss(self.monitors['loss_train'].history, 'Loss Per Batch', 'Iterations', 'loss_batch')
             profiler.step()  # monitor
 
@@ -396,9 +397,10 @@ def print_args(args_dict):
 def hyperparam_tuning():
     import itertools
 
-    # 0.2, 5e-4
+    # post      0.2     5e-4
+    # el-nodup  0.2     1e-3
     lr_choices = [5e-2, 1e-1, 2e-1, 5e-1]
-    reg_choices = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2]
+    reg_choices = [1e-4, 2e-4, 5e-4, 1e-3, 5e-3]
 
     results = {}
 
@@ -411,7 +413,7 @@ def hyperparam_tuning():
             training = ClassificationTraining()
             training.train(args.n_epochs, do_save=False)
 
-            lasterr = np.mean(training.monitors['accu_val'].epochs[:-10])
+            lasterr = np.mean(training.monitors['accu_val'].epochs[:-4])
             print('Last err: {}'.format(lasterr))
 
             fn = training.save()
