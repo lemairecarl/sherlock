@@ -10,6 +10,7 @@ import torch.optim as optim
 import torch.utils.data as data
 from torch.utils.data.sampler import SubsetRandomSampler
 
+from dataset import SherlockDataset
 from utils import MetricHistory, SimpleProfiler
 from visdom_helper import VisdomHelper
 
@@ -31,13 +32,14 @@ def str2bool(x):
         raise TypeError('Could not cast to bool.')
 
 parser = argparse.ArgumentParser()
-# Training setup and hyper params
 parser.add_argument('granularite', choices=['el', 'post'])
+parser.add_argument('--pred', action='store_true', help='Generate predictions')
+# Training setup and hyper params
 parser.add_argument('--load', '-l', type=str, default=None)
 parser.add_argument('--path', type=str, default=None)
 parser.add_argument('--lr', default=0.2, type=float, help='learning rate')
-parser.add_argument('--steps', default='20,100', type=str, help='epoch ids of lr step, e.g. 30,60,100')
-parser.add_argument('--reg', default=1e-3, type=float, help='l2 regul')
+parser.add_argument('--steps', default='100,150', type=str, help='epoch ids of lr step, e.g. 30,60,100')
+parser.add_argument('--reg', default=2e-4, type=float, help='l2 regul')
 parser.add_argument('--n_epochs', '-e', default=300, type=int, help='max epochs')
 parser.add_argument('--batch_size', '-b', default=32, type=int)
 # Utilities
@@ -95,7 +97,7 @@ class ClassificationTraining(object):
 
     @staticmethod
     def get_validation_set(dataset, validation_ratio=0.1):
-        filename = dataset.__class__.__name__ + '_valsplit.pkl'
+        filename = dataset.name + '_valsplit.pkl'
         try:
             train_idx, val_idx = torch.load(filename)
         except FileNotFoundError:
@@ -111,20 +113,21 @@ class ClassificationTraining(object):
     def prepare_data(self):
         print('==> Preparing data...')
 
-        data_file = 'hochelaga_{}.pt'.format({'el': 'electeur', 'post': 'postal'}[args.granularite])
-        predictors, targets = torch.load(data_file)
-        self.dataset = data.TensorDataset(predictors, targets)
+        self.dataset = SherlockDataset(args.granularite, predict=args.pred)
 
-        train_idx, val_idx = self.get_validation_set(self.dataset, validation_ratio=0.1)
-        train_sampler = SubsetRandomSampler(train_idx)
-        val_sampler = SubsetRandomSampler(val_idx)
-        self.train_loader = data.DataLoader(self.dataset, args.batch_size, num_workers=args.workers,
-                                            sampler=train_sampler, pin_memory=True)
-        self.val_loader = data.DataLoader(self.dataset, args.batch_size, num_workers=args.workers, sampler=val_sampler,
-                                          pin_memory=True)
+        if args.pred:
+            self.val_loader = data.DataLoader(self.dataset, args.batch_size, num_workers=args.workers, pin_memory=True)
+        else:
+            train_idx, val_idx = self.get_validation_set(self.dataset, validation_ratio=0.1)
+            train_sampler = SubsetRandomSampler(train_idx)
+            val_sampler = SubsetRandomSampler(val_idx)
+            self.train_loader = data.DataLoader(self.dataset, args.batch_size, num_workers=args.workers,
+                                                sampler=train_sampler, pin_memory=True)
+            self.val_loader = data.DataLoader(self.dataset, args.batch_size, num_workers=args.workers,
+                                              sampler=val_sampler, pin_memory=True)
 
-        self.num_features = predictors.size(1)
-        self.num_classes = targets.size(1)
+        self.num_features = self.dataset.num_features
+        self.num_classes = self.dataset.num_classes
 
     def make_optimizer(self, l2_reg=args.reg):
         self.optimizer = optim.Adam(self.net.parameters(), weight_decay=l2_reg)
@@ -244,12 +247,11 @@ class ClassificationTraining(object):
         self.last_checkpoint = full_filename
         return filename
 
-    def error_fn(self, output, target, relative=False):
-        total_pct = target.sum(dim=1, keepdim=True)
+    def error_fn(self, pred, target, relative=False):
         if relative:
-            e = torch.abs(torch.exp(output) * total_pct - target) / target
+            e = torch.abs(pred - target) / target
         else:
-            e = torch.abs(torch.exp(output) * total_pct - target)
+            e = torch.abs(pred - target)
         return torch.mean(e, dim=0)
 
     def update_err_monitors(self, err, rerr):
@@ -295,7 +297,11 @@ class ClassificationTraining(object):
             loss_value = float(loss)
             profiler.step()  # sync (fetching the value of the loss causes a sync between CPU and GPU)
 
-            err = self.error_fn(output.data, targets)
+            # compute % (ajusted for total pct)
+            total_pct = targets.sum(dim=1, keepdim=True)
+            pred = torch.exp(output.data) * total_pct
+
+            err = self.error_fn(pred, targets)
             self.monitors['accu_train'].update(float(err[0]))  # qs
             self.monitors['loss_train'].update(loss_value)
 
@@ -337,7 +343,11 @@ class ClassificationTraining(object):
             loss = self.criterion(output, target_var)
             loss_value = float(loss)
 
-            err = self.error_fn(output.data, targets)
+            # compute % (ajusted for total pct)
+            total_pct = targets.sum(dim=1, keepdim=True)
+            pred = torch.exp(output.data) * total_pct
+
+            err = self.error_fn(pred, targets)
             self.monitors['accu_val'].update(float(err[0]))  # qs
             self.monitors['loss_val'].update(loss_value)
             rerr = self.error_fn(output.data, targets, relative=True)
@@ -355,6 +365,59 @@ class ClassificationTraining(object):
         self.monitors['loss_val'].end_epoch()
         self.monitors['accu_val'].end_epoch()
         self.epoch_end_err_monitors()
+        
+    def predict(self):
+        print('==> Predicting...')
+        self.net.eval()
+
+        predictions = []
+        ids = []
+        
+        for batch_idx, (input_data, targets, key_cols) in enumerate(self.val_loader):
+            if args.cuda:
+                input_data = input_data.cuda(async=True)
+                targets = targets.cuda(async=True)
+
+            input_var = torch.autograd.Variable(input_data, volatile=True)
+            targets_norm = targets / targets.sum(dim=1, keepdim=True)  # sum to 1
+            target_var = torch.autograd.Variable(targets_norm, volatile=True)
+
+            # compute output
+            output = self.net(input_var)
+            loss = self.criterion(output, target_var)
+            loss_value = float(loss)
+
+            # compute % (ajusted for total pct)
+            total_pct = targets.sum(dim=1, keepdim=True)
+            pred = torch.exp(output.data) * total_pct
+            
+            # store predictions
+            predictions.append(pred)
+            ids.append(key_cols)
+
+            err = self.error_fn(pred, targets)
+            self.monitors['accu_val'].update(float(err[0]))  # qs
+            self.monitors['loss_val'].update(loss_value)
+            rerr = self.error_fn(output.data, targets, relative=True)
+            self.update_err_monitors(err, rerr)
+
+            if args.print_freq != -1 and batch_idx % args.print_freq == 0:
+                print('{}     {}/{}    Last loss: {:.6f}    Avg loss: {:.6f}'.format(time.strftime("%Y-%m-%d %H-%M-%S"),
+                                                                                     batch_idx, len(self.train_loader),
+                                                                                     float(loss),
+                                                                                     self.monitors['loss_val'].avg))
+
+            self.vis.update_status(0, 'Predict', batch_idx, len(self.val_loader), float(loss),
+                                   self.monitors['loss_val'].avg, self.monitors['accu_val'].avg)
+
+        # Save predictions
+        with open('pred.csv', 'w') as f:
+            for batch_ids, batch_pred in zip(ids, predictions):
+                post_codes, section_ids = batch_ids
+                for postc, sect, pred in zip(post_codes, section_ids, batch_pred):
+                    line = [postc, str(sect)] + ['{:.3f}'.format(p) for p in pred]
+                    line_str = ','.join(line)
+                    f.write(line_str + '\n')
 
     def train(self, num_epochs=200, do_save=True):
         print('==> Training...')
@@ -397,8 +460,9 @@ def print_args(args_dict):
 def hyperparam_tuning():
     import itertools
 
-    # post      0.2     5e-4
-    # el-nodup  0.2     1e-3
+    # post            0.2     5e-4
+    # el-nodup(fk)    0.2     1e-3
+    # el-nodup        0.2     2e-4
     lr_choices = [5e-2, 1e-1, 2e-1, 5e-1]
     reg_choices = [1e-4, 2e-4, 5e-4, 1e-3, 5e-3]
 
@@ -431,6 +495,9 @@ if __name__ == '__main__':
 
     if args.tuning:
         hyperparam_tuning()
+    elif args.pred:
+        training = ClassificationTraining()
+        training.predict()
     else:
         training = ClassificationTraining()
         training.train(args.n_epochs)

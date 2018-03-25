@@ -11,18 +11,15 @@ args = ap.parse_args()
 print('Loading data...')
 dataf = pd.read_csv('hochelaga.csv')
 
+print('Total lines:', len(dataf))
+
 if args.granularite == 'post':
     print('Removing duplicates...')
-    print('Before drop dupl', len(dataf))
     dataf = dataf.drop_duplicates('code_postal')
     print(' After drop dupl', len(dataf))
 else:
-    print('Removing electeur id...')
-    print(dataf.columns[0])
-    dataf.drop(dataf.columns[0], axis=1, inplace=True)
     print('Removing duplicates...')
-    print('Before drop dupl', len(dataf))
-    dataf = dataf.drop_duplicates()
+    dataf = dataf.drop_duplicates(['code_postal', 'section_id'])
     print(' After drop dupl', len(dataf))
 
 target_col_names = ['pct_qs',
@@ -33,12 +30,19 @@ target_col_names = ['pct_qs',
                     'pct_pv']
 target_vars = [dataf[k] for k in target_col_names]
 
+key_cols = [
+    #dataf['voter_id'].values.tolist(),
+    dataf['code_postal'].values.tolist(),
+    dataf['section_id'].values.tolist()
+]
+key_cols = list(zip(*key_cols))
+
 print('Selecting and transforming variables...')
 sel_vars = [
 #    dataf['lat'],
 #    dataf['lon'],
     #dataf['zone_urbaine'],
-    dataf['appartement?'],
+    #dataf['appartement?'],
     # POPULATION
     dataf['PP_FEMALE'] / dataf['PP_TOT'],
     dataf['PP_PP_MED'],
@@ -110,7 +114,7 @@ print('Targets:    ', targets.shape)
 
 print('Saving...')
 suffix = {'el': 'electeur', 'post': 'postal'}[args.granularite]
-torch.save((predictors, targets), 'hochelaga_{}.pt'.format(suffix))
+torch.save((predictors, targets, key_cols), 'hochelaga_{}.pt'.format(suffix))
 
 print('Done.')
 print('DELETER LE VALSPLIT!')
